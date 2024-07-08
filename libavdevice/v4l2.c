@@ -90,6 +90,14 @@ struct video_data {
     int multi_planer;
     int ts_mode;
     int ignore_input_error;
+
+    // Command line argument
+    int max_read_failures;
+    int read_failure_cnt;
+    // True if at least one real data frame received. This flag is needed because
+    // there are thousands of EAGAIN read failures during first initialization
+    int read_started;
+
     TimeFilter *timefilter;
     int64_t last_time_m;
 
@@ -124,6 +132,9 @@ struct buff_data {
     struct video_data *s;
     int index;
 };
+
+static int v4l2_read_header(AVFormatContext *ctx);
+static int v4l2_read_close(AVFormatContext *ctx);
 
 static int device_open(AVFormatContext *ctx, const char* device_path)
 {
@@ -549,14 +560,25 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     /* FIXME: Some special treatment might be needed in case of loss of signal... */
     while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && (errno == EINTR));
     if (res < 0) {
-        if (errno == EAGAIN)
+        if (errno == EAGAIN) {
+            s->read_failure_cnt++;
+            if(s->read_started && s->read_failure_cnt > s->max_read_failures) {
+                av_log(ctx, AV_LOG_WARNING, "Number of read errors exceeded %d. Restart...\n", s->max_read_failures);
+                s->read_failure_cnt = 0;
+                v4l2_read_close(ctx);
+                v4l2_read_header(ctx);
+            }
             return AVERROR(EAGAIN);
+        }
 
         res = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n",
                av_err2str(res));
         return res;
     }
+
+    s->read_started = 1;
+    s->read_failure_cnt = 0;
 
     buf_ts = buf.timestamp;
 
@@ -1220,6 +1242,7 @@ static const AVOption options[] = {
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "ignore_input_error", "ignore input error",                                 OFFSET(ignore_input_error), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1,      DEC },
+    { "max_read_failures", "max number of read failures before restart",          OFFSET(max_read_failures),  AV_OPT_TYPE_INT,  {.i64 = 20}, 20, INT_MAX,DEC },
 
     { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, "list_formats" },
     { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, "list_formats" },
